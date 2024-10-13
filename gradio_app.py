@@ -151,6 +151,7 @@ nltk.download('punkt_tab')
 model=None
 model_params=None
 sampler=None
+gModelType=None
 
 def normalize_audio(samples):
     # Convert the samples to a numpy array for easier manipulation
@@ -227,27 +228,40 @@ def loadModel(Config_File, Model_File):
     return
         
 def loadModelType(ModelType):
+    global gModelType 
+    gModelType = ModelType
+
     if ModelType=="StyleTTS2-LibriTTS":
         gr.Info("Loading StyleTTS2-LibriTTS Model...")
         loadModel("Models/LibriTTS/config.yml", "Models/LibriTTS/epochs_2nd_00020.pth")
     elif ModelType=="StyleTTS2-LJSpeech":
         gr.Info("Loading StyleTTS2-LJSpeech Model...")
         loadModel("Models/LJSpeech/config.yml", "Models/LJSpeech/epoch_2nd_00100.pth")
+    elif ModelType=="APSpeech":
+        gr.Info("Loading APSpeech Model...")
+        loadModel("Models/APSpeech/config_ft.yml", "Models/APSpeech/epoch_2nd_00049.pth")
+    elif ModelType=="ASMRSpeech":
+        gr.Info("Loading ASMRSpeech Model...")
+        loadModel("Models/ASMRSpeech/config_ft.yml", "Models/ASMRSpeech/epoch_2nd_00049.pth")
 
     gr.Info("Loading Complete...")
     return      
 
 #model, model_params, sampler = loadModel("Models/LibriTTS/config.yml", "Models/LibriTTS/epochs_2nd_00020.pth")
-#Setup Global Variables
-
 #model, model_params, sampler = loadModel("Models/LJSpeech/config.yml", "Models/LJSpeech/epoch_2nd_00100.pth")
 
-def inferTTS2(ref_text_input, ref_audio_input, alpha = 0.3, beta = 0.7, diffusion_steps=5, embedding_scale=1, speed=1, normalise_output=False, normalise_input=False):
-    gr.Info("Process Input Reference...")
-    ref_s = compute_style(ref_audio_input,normalise_input)
-    gr.Info("Generate Output Audio...")
-    wav = inference(ref_text_input, ref_s, alpha, beta, diffusion_steps, embedding_scale, speed)
+def inferTTS2(ref_text_input, ref_audio_input=[], alpha = 0.3, beta = 0.7, diffusion_steps=5, embedding_scale=1, speed=1, normalise_output=False, normalise_input=False):
     
+    if(gModelType=="StyleTTS2-LJSpeech"):
+        noise = torch.randn(1,1,256).to(device)
+        gr.Info("Generate Output Audio...")
+        wav = inferenceWithOutRef(ref_text_input, noise, diffusion_steps, embedding_scale, speed)
+    else:
+        gr.Info("Process Input Reference...")
+        ref_s = compute_style(ref_audio_input,normalise_input)
+        gr.Info("Generate Output Audio...")
+        wav = inferenceWithRef(ref_text_input, ref_s, alpha, beta, diffusion_steps, embedding_scale, speed)
+
     if(normalise_output):
         gr.Info("Normalising Output Audio...")
         wav = normalize_audio(wav)
@@ -255,7 +269,7 @@ def inferTTS2(ref_text_input, ref_audio_input, alpha = 0.3, beta = 0.7, diffusio
     gr.Info("Complete...")
     return (24000, wav)
 
-def inference(text, ref_s, alpha = 0.3, beta = 0.7, diffusion_steps=5, embedding_scale=1, speed=1):
+def inferenceWithRef(text, ref_s, alpha = 0.3, beta = 0.7, diffusion_steps=5, embedding_scale=1, speed=1):
     text = text.strip()
     ps = global_phonemizer.phonemize([text])
     ps = word_tokenize(ps[0])
@@ -325,7 +339,57 @@ def inference(text, ref_s, alpha = 0.3, beta = 0.7, diffusion_steps=5, embedding
         
     return out.squeeze().cpu().numpy()[..., :-50] # weird pulse at the end of the model, need to be fixed later
     
+def inferenceWithOutRef(text, noise, diffusion_steps=5, embedding_scale=1, speed=1):
+   
+    text = text.strip()
+    text = text.replace('"', '')
+    ps = global_phonemizer.phonemize([text])
+    ps = word_tokenize(ps[0])
+    ps = ' '.join(ps)
+
+    tokens = textclenaer(ps)
+    tokens.insert(0, 0)
+    tokens = torch.LongTensor(tokens).to(device).unsqueeze(0)
     
+    with torch.no_grad():
+        input_lengths = torch.LongTensor([tokens.shape[-1]]).to(tokens.device)
+        text_mask = length_to_mask(input_lengths).to(tokens.device)
+
+        t_en = model.text_encoder(tokens, input_lengths, text_mask)
+        bert_dur = model.bert(tokens, attention_mask=(~text_mask).int())
+        d_en = model.bert_encoder(bert_dur).transpose(-1, -2) 
+
+        s_pred = sampler(noise, 
+              embedding=bert_dur[0].unsqueeze(0), num_steps=diffusion_steps,
+              embedding_scale=embedding_scale).squeeze(0)
+
+        s = s_pred[:, 128:]
+        ref = s_pred[:, :128]
+
+        d = model.predictor.text_encoder(d_en, s, input_lengths, text_mask)
+
+        x, _ = model.predictor.lstm(d)
+        duration = model.predictor.duration_proj(x)
+        duration = torch.sigmoid(duration).sum(axis=-1)
+        duration = duration*1/speed
+
+        pred_dur = torch.round(duration.squeeze()).clamp(min=1)
+
+        pred_dur[-1] += 5
+
+        pred_aln_trg = torch.zeros(input_lengths, int(pred_dur.sum().data))
+        c_frame = 0
+        for i in range(pred_aln_trg.size(0)):
+            pred_aln_trg[i, c_frame:c_frame + int(pred_dur[i].data)] = 1
+            c_frame += int(pred_dur[i].data)
+
+        # encode prosody
+        en = (d.transpose(-1, -2) @ pred_aln_trg.unsqueeze(0).to(device))
+        F0_pred, N_pred = model.predictor.F0Ntrain(en, s)
+        out = model.decoder((t_en @ pred_aln_trg.unsqueeze(0).to(device)), 
+                                F0_pred, N_pred, ref.squeeze().unsqueeze(0))
+        
+    return out.squeeze().cpu().numpy()
 
 #pipe = pipeline(
 #    "automatic-speech-recognition",
@@ -510,7 +574,7 @@ If you're having issues, try converting your reference audio to WAV or MP3, clip
     ref_audio_input = gr.Audio(label="Reference Audio", type="filepath")
     gen_text_input = gr.Textbox(value="This is a TTS text to speech model that uses style diffusion to create human like speech, can you tell that this is not real?", label="Text to Generate (max 200 chars.)", lines=4)
     model_choice = gr.Radio(
-        choices=["StyleTTS2-LJSpeech", "StyleTTS2-LibriTTS"], label="Choose TTS Model", value="StyleTTS2-LibriTTS"
+        choices=["StyleTTS2-LJSpeech", "StyleTTS2-LibriTTS","APSpeech","ASMRSpeech"], label="Choose TTS Model", value="StyleTTS2-LibriTTS"
     )
 
     load_btn = gr.Button("Load Model", variant="primary")
@@ -519,7 +583,7 @@ If you're having issues, try converting your reference audio to WAV or MP3, clip
         alpha = gr.Number(value=0.3,label="Alpha",step=0.1)
         beta = gr.Number(value=0.7,label="Beta",step=0.1)
         diffusion_steps=gr.Number(value=10,label="Steps")
-        embedding_scale=gr.Number(value=1,label="Embedding Scale")
+        embedding_scale=gr.Number(value=1.5,label="Embedding Scale")
         speed=gr.Number(value=1,label="Speed Up",step=0.05)
         
         normalise_output = gr.Checkbox(
