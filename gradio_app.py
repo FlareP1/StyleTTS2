@@ -147,6 +147,11 @@ gr.Info("Loading Punkt...")
 import nltk
 nltk.download('punkt_tab')
 
+# Setup Global Model variables
+model=None
+model_params=None
+sampler=None
+
 def normalize_audio(samples):
     # Convert the samples to a numpy array for easier manipulation
     #samples = np.array(samples, dtype=np.float32)
@@ -162,6 +167,12 @@ def normalize_audio(samples):
 
 def loadModel(Config_File, Model_File):
     gr.Info("Loading Models...")
+
+    #Ensure that updates are performed to the global variables
+    global model
+    global model_params
+    global sampler
+
     #config = yaml.safe_load(open("Models/LibriTTS/config.yml"))
     config = yaml.safe_load(open(Config_File))
 
@@ -213,11 +224,23 @@ def loadModel(Config_File, Model_File):
         sigma_schedule=KarrasSchedule(sigma_min=0.0001, sigma_max=3.0, rho=9.0), # empirical parameters
         clamp=False
     )
-
-    return model,model_params,sampler
+    return
         
+def loadModelType(ModelType):
+    if ModelType=="StyleTTS2-LibriTTS":
+        gr.Info("Loading StyleTTS2-LibriTTS Model...")
+        loadModel("Models/LibriTTS/config.yml", "Models/LibriTTS/epochs_2nd_00020.pth")
+    elif ModelType=="StyleTTS2-LJSpeech":
+        gr.Info("Loading StyleTTS2-LJSpeech Model...")
+        loadModel("Models/LJSpeech/config.yml", "Models/LJSpeech/epoch_2nd_00100.pth")
+
+    gr.Info("Loading Complete...")
+    return      
+
 #model, model_params, sampler = loadModel("Models/LibriTTS/config.yml", "Models/LibriTTS/epochs_2nd_00020.pth")
-model, model_params, sampler = loadModel("Models/LJSpeech/config.yml", "Models/LJSpeech/epoch_2nd_00100.pth")
+#Setup Global Variables
+
+#model, model_params, sampler = loadModel("Models/LJSpeech/config.yml", "Models/LJSpeech/epoch_2nd_00100.pth")
 
 def inferTTS2(ref_text_input, ref_audio_input, alpha = 0.3, beta = 0.7, diffusion_steps=5, embedding_scale=1, speed=1, normalise_output=False, normalise_input=False):
     gr.Info("Process Input Reference...")
@@ -485,11 +508,12 @@ If you're having issues, try converting your reference audio to WAV or MP3, clip
 
     
     ref_audio_input = gr.Audio(label="Reference Audio", type="filepath")
-    gen_text_input = gr.Textbox(label="Text to Generate (max 200 chars.)", lines=4)
+    gen_text_input = gr.Textbox(value="This is a TTS text to speech model that uses style diffusion to create human like speech, can you tell that this is not real?", label="Text to Generate (max 200 chars.)", lines=4)
     model_choice = gr.Radio(
-        choices=["StyleTTS2-LJSpeech", "StyleTTS2-LibriTTS"], label="Choose TTS Model", value="StyleTTS2-LJSpeech"
+        choices=["StyleTTS2-LJSpeech", "StyleTTS2-LibriTTS"], label="Choose TTS Model", value="StyleTTS2-LibriTTS"
     )
 
+    load_btn = gr.Button("Load Model", variant="primary")
     generate_btn = gr.Button("Synthesize", variant="primary")
     with gr.Accordion("Advanced Settings", open=False):
         alpha = gr.Number(value=0.3,label="Alpha",step=0.1)
@@ -515,14 +539,13 @@ If you're having issues, try converting your reference audio to WAV or MP3, clip
     audio_output = gr.Audio(label="Synthesized Audio")
     spectrogram_output = gr.Image(label="Spectrogram")
 
-    #generate_btn.click(
-    #    loadModel,
-    #    inputs=[
-    #        model_cfg_file,
-    #        model_file,
-    #    ],
-    #   outputs=[model, model_params, sampler],
-    #)
+    load_btn.click(
+        loadModelType,
+        inputs=[
+            model_choice,
+        ],
+       outputs=[],
+    )
 
     generate_btn.click(
         inferTTS2,
