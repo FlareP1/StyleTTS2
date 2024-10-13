@@ -1,0 +1,4 @@
+cached_path>=1.6.3
+click
+gradio
+pydub
