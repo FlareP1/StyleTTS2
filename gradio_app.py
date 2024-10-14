@@ -260,7 +260,7 @@ def inferTTS2(ref_text_input, ref_audio_input=[], alpha = 0.3, beta = 0.7, diffu
         gr.Info("Process Input Reference...")
         ref_s = compute_style(ref_audio_input,normalise_input)
         gr.Info("Generate Output Audio...")
-        wav = inferenceWithRef(ref_text_input, ref_s, alpha, beta, diffusion_steps, embedding_scale, speed)
+        wav = LongFormInference(ref_text_input, ref_s, alpha, beta, diffusion_steps, embedding_scale, speed)
 
     if(normalise_output):
         gr.Info("Normalising Output Audio...")
@@ -310,6 +310,10 @@ def inferenceWithRef(text, ref_s, alpha = 0.3, beta = 0.7, diffusion_steps=5, em
 
         pred_dur = torch.round(duration.squeeze()).clamp(min=1)
 
+        # Eliminate potential noise at the end of the audio during generation.
+        if not text[-1].isalnum():
+            pred_dur[-1] = 0
+
         pred_aln_trg = torch.zeros(input_lengths, int(pred_dur.sum().data))
         c_frame = 0
         for i in range(pred_aln_trg.size(0)):
@@ -338,7 +342,113 @@ def inferenceWithRef(text, ref_s, alpha = 0.3, beta = 0.7, diffusion_steps=5, em
     
         
     return out.squeeze().cpu().numpy()[..., :-50] # weird pulse at the end of the model, need to be fixed later
+
+def LFinferenceWithRef(text, s_prev, ref_s, alpha = 0.3, beta = 0.7, t = 0.7, diffusion_steps=5, embedding_scale=1, speedup=1):
+    text = text.strip()
+    ps = global_phonemizer.phonemize([text])
+    ps = word_tokenize(ps[0])
+    ps = ' '.join(ps)
+    ps = ps.replace('``', '"')
+    ps = ps.replace("''", '"')
+
+    tokens = textclenaer(ps)
+    tokens.insert(0, 0)
+    tokens = torch.LongTensor(tokens).to(device).unsqueeze(0)
     
+    with torch.no_grad():
+        input_lengths = torch.LongTensor([tokens.shape[-1]]).to(device)
+        text_mask = length_to_mask(input_lengths).to(device)
+
+        t_en = model.text_encoder(tokens, input_lengths, text_mask)
+        bert_dur = model.bert(tokens, attention_mask=(~text_mask).int())
+        d_en = model.bert_encoder(bert_dur).transpose(-1, -2) 
+        len=128
+
+        s_pred = sampler(noise = torch.randn((1, len*2)).unsqueeze(1).to(device), 
+                                          embedding=bert_dur,
+                                          embedding_scale=embedding_scale,
+                                            features=ref_s, # reference from the same speaker as the embedding
+                                             num_steps=diffusion_steps).squeeze(1)
+        
+        if s_prev is not None:
+            # convex combination of previous and current style
+            s_pred = t * s_prev + (1 - t) * s_pred
+        
+        s = s_pred[:, len:]
+        ref = s_pred[:, :len]
+        
+        ref = alpha * ref + (1 - alpha)  * ref_s[:, :len]
+        s = beta * s + (1 - beta)  * ref_s[:, len:]
+
+        s_pred = torch.cat([ref, s], dim=-1)
+
+        d = model.predictor.text_encoder(d_en, 
+                                         s, input_lengths, text_mask)
+
+        x, _ = model.predictor.lstm(d)
+        duration = model.predictor.duration_proj(x) #speedup by 1/0.95x
+       
+        duration = torch.sigmoid(duration).sum(axis=-1)
+        duration = duration*1/speedup
+
+        pred_dur = torch.round(duration.squeeze()).clamp(min=1)
+
+        # Eliminate potential noise at the end of the audio during generation.
+        if not text[-1].isalnum():
+          pred_dur[-1] = 0
+
+        pred_aln_trg = torch.zeros(input_lengths, int(pred_dur.sum().data))
+        c_frame = 0
+        for i in range(pred_aln_trg.size(0)):
+            pred_aln_trg[i, c_frame:c_frame + int(pred_dur[i].data)] = 1
+            c_frame += int(pred_dur[i].data)
+
+        # encode prosody
+        en = (d.transpose(-1, -2) @ pred_aln_trg.unsqueeze(0).to(device))
+        if model_params.decoder.type == "hifigan":
+            asr_new = torch.zeros_like(en)
+            asr_new[:, :, 0] = en[:, :, 0]
+            asr_new[:, :, 1:] = en[:, :, 0:-1]
+            en = asr_new
+
+        F0_pred, N_pred = model.predictor.F0Ntrain(en, s)
+
+        asr = (t_en @ pred_aln_trg.unsqueeze(0).to(device))
+        if model_params.decoder.type == "hifigan":
+            asr_new = torch.zeros_like(asr)
+            asr_new[:, :, 0] = asr[:, :, 0]
+            asr_new[:, :, 1:] = asr[:, :, 0:-1]
+            asr = asr_new
+
+        out = model.decoder(asr, 
+                                F0_pred, N_pred, ref.squeeze().unsqueeze(0))
+    
+    return out.squeeze().cpu().numpy()[..., :-8000], s_pred # weird pulse at the end of the model, need to be fixed later
+  
+def LongFormInference(passage, s_ref, alpha = 0.3, beta = 0.7, diffusion_steps=5, embedding_scale=1, speed=1):
+    gr.Info("Generate LongFormInference...")
+    sentences = passage.split('.') # simple split by comma
+    wavs = []
+    s_prev = None
+    t = 0.35
+    for text in sentences:
+        gr.Info("Generate {text}...")
+        if text.strip() == "": continue
+        #text +=  '.' # add it back
+        text = '..... ' + text + ' .....$' # Pad the beginning of the speech with . to prevent the iregular behaviour wiht the first word
+    
+        wav, s_prev = LFinferenceWithRef(text, 
+                            s_prev, 
+                            s_ref, 
+                            alpha, 
+                            beta,  # make it more suitable for the text
+                            t, 
+                            diffusion_steps,
+                            embedding_scale, speed)
+        wavs.append(wav)
+    gr.Info("Complete...")
+    return np.concatenate(wavs)
+
 def inferenceWithOutRef(text, noise, diffusion_steps=5, embedding_scale=1, speed=1):
    
     text = text.strip()
@@ -570,7 +680,6 @@ If you're having issues, try converting your reference audio to WAV or MP3, clip
 """
     )
 
-    
     ref_audio_input = gr.Audio(label="Reference Audio", type="filepath")
     gen_text_input = gr.Textbox(value="This is a TTS text to speech model that uses style diffusion to create human like speech, can you tell that this is not real?", label="Text to Generate (max 200 chars.)", lines=4)
     model_choice = gr.Radio(
